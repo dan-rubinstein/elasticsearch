@@ -492,6 +492,57 @@ public final class ServiceUtils {
         return optionalField;
     }
 
+    public static Float extractRequiredFloatBetween(
+        Map<String, Object> map,
+        String settingName,
+        float minValue,
+        float maxValue,
+        String scope,
+        ValidationException validationException
+    ) {
+        Float field = extractRequiredFloat(map, settingName, scope, validationException);
+
+        if (field != null && field < minValue) {
+            validationException.addValidationError(
+                ServiceUtils.mustBeGreaterThanOrEqualNumberErrorMessage(settingName, scope, field, minValue)
+            );
+            return null;
+        }
+        if (field != null && field > maxValue) {
+            validationException.addValidationError(
+                ServiceUtils.mustBeLessThanOrEqualNumberErrorMessage(settingName, scope, field, maxValue)
+            );
+            return null;
+        }
+
+        return field;
+    }
+
+    public static Float extractRequiredFloat(
+        Map<String, Object> map,
+        String settingName,
+        String scope,
+        ValidationException validationException
+    ) {
+        int initialValidationErrorCount = validationException.validationErrors().size();
+        Double field = ServiceUtils.removeAsType(map, settingName, Double.class, validationException);
+
+        if (validationException.validationErrors().size() > initialValidationErrorCount) {
+            return null;
+        }
+
+        if (field == null) {
+            validationException.addValidationError(ServiceUtils.missingSettingErrorMsg(settingName, scope));
+        }
+
+        if (validationException.validationErrors().size() > initialValidationErrorCount) {
+            return null;
+        }
+
+        assert field != null;
+        return field.floatValue();
+    }
+
     public static Float extractOptionalFloat(Map<String, Object> map, String settingName) {
         return ServiceUtils.removeAsType(map, settingName, Float.class);
     }

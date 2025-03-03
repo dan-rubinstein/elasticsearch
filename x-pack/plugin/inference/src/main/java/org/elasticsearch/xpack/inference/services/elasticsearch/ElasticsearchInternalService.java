@@ -54,7 +54,11 @@ import org.elasticsearch.xpack.core.ml.inference.trainedmodel.TextExpansionConfi
 import org.elasticsearch.xpack.core.ml.inference.trainedmodel.TextSimilarityConfig;
 import org.elasticsearch.xpack.core.ml.inference.trainedmodel.TextSimilarityConfigUpdate;
 import org.elasticsearch.xpack.inference.chunking.ChunkingSettingsBuilder;
+import org.elasticsearch.xpack.inference.chunking.ClusterSemanticChunker;
+import org.elasticsearch.xpack.inference.chunking.ClusterSemanticChunkingSettings;
 import org.elasticsearch.xpack.inference.chunking.EmbeddingRequestChunker;
+import org.elasticsearch.xpack.inference.chunking.SemanticChunker;
+import org.elasticsearch.xpack.inference.chunking.SemanticChunkingSettings;
 import org.elasticsearch.xpack.inference.services.ConfigurationParseContext;
 import org.elasticsearch.xpack.inference.services.ServiceUtils;
 
@@ -724,20 +728,63 @@ public class ElasticsearchInternalService extends BaseElasticsearchInternalServi
         }
 
         if (model instanceof ElasticsearchInternalModel esModel) {
+            // TODO: Figure out how to merge the if statements into a single call to the ChunkerBuilder
+            ChunkingSettings chunkingSettings = model.getConfigurations().getChunkingSettings();
+            if (chunkingSettings instanceof SemanticChunkingSettings) {
+                SemanticChunker semanticChunker = new SemanticChunker(
+                    this,
+                    esModel,
+                    input.getFirst(),
+                    chunkingSettings,
+                    ActionListener.wrap(batchedRequests -> {
+                        if (batchedRequests.isEmpty()) {
+                            listener.onResponse(List.of());
+                        } else {
+                            // Avoid filling the inference queue by executing the batches in series
+                            // Each batch contains up to EMBEDDING_MAX_BATCH_SIZE inference request
+                            var sequentialRunner = new BatchIterator(esModel, inputType, timeout, batchedRequests);
+                            sequentialRunner.run();
+                        }
+                    }, listener::onFailure),
+                    listener
+                );
 
-            List<EmbeddingRequestChunker.BatchRequestAndListener> batchedRequests = new EmbeddingRequestChunker(
-                input,
-                EMBEDDING_MAX_BATCH_SIZE,
-                esModel.getConfigurations().getChunkingSettings()
-            ).batchRequestsWithListeners(listener);
+                semanticChunker.chunk();
+            } else if (chunkingSettings instanceof ClusterSemanticChunkingSettings) {
+                ClusterSemanticChunker semanticChunker = new ClusterSemanticChunker(
+                    this,
+                    esModel,
+                    input.getFirst(),
+                    chunkingSettings,
+                    ActionListener.wrap(batchedRequests -> {
+                        if (batchedRequests.isEmpty()) {
+                            listener.onResponse(List.of());
+                        } else {
+                            // Avoid filling the inference queue by executing the batches in series
+                            // Each batch contains up to EMBEDDING_MAX_BATCH_SIZE inference request
+                            var sequentialRunner = new BatchIterator(esModel, inputType, timeout, batchedRequests);
+                            sequentialRunner.run();
+                        }
+                    }, listener::onFailure),
+                    listener
+                );
 
-            if (batchedRequests.isEmpty()) {
-                listener.onResponse(List.of());
+                semanticChunker.chunk();
             } else {
-                // Avoid filling the inference queue by executing the batches in series
-                // Each batch contains up to EMBEDDING_MAX_BATCH_SIZE inference request
-                var sequentialRunner = new BatchIterator(esModel, inputType, timeout, batchedRequests);
-                sequentialRunner.run();
+                List<EmbeddingRequestChunker.BatchRequestAndListener> batchedRequests = new EmbeddingRequestChunker(
+                    input,
+                    EMBEDDING_MAX_BATCH_SIZE,
+                    chunkingSettings
+                ).batchRequestsWithListeners(listener);
+
+                if (batchedRequests.isEmpty()) {
+                    listener.onResponse(List.of());
+                } else {
+                    // Avoid filling the inference queue by executing the batches in series
+                    // Each batch contains up to EMBEDDING_MAX_BATCH_SIZE inference request
+                    var sequentialRunner = new BatchIterator(esModel, inputType, timeout, batchedRequests);
+                    sequentialRunner.run();
+                }
             }
         } else {
             listener.onFailure(notElasticsearchModelException(model));

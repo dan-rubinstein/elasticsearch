@@ -73,6 +73,36 @@ public class EmbeddingRequestChunker {
         this(inputs, maxNumberOfInputsPerBatch, new WordBoundaryChunkingSettings(wordsPerChunk, chunkOverlap));
     }
 
+    public EmbeddingRequestChunker(List<String> inputs, List<List<ChunkOffset>> chunkedInputs, int maxNumberOfInputsPerBatch) {
+        // TODO: Figure out how to clean up the process here.
+        // Ideally it can merge with the existing process or it should be a different chunker?
+        this.inputs = inputs;
+        this.results = new ArrayList<>(inputs.size());
+        this.errors = new AtomicArray<>(inputs.size());
+
+        this.requests = new ArrayList<>(inputs.size());
+
+        for (int inputIndex = 0; inputIndex < inputs.size(); inputIndex++) {
+            List<ChunkOffset> chunks = chunkedInputs.get(inputIndex);
+            List<Request> requestForInput = new ArrayList<>(chunks.size());
+            for (int chunkIndex = 0; chunkIndex < chunks.size(); chunkIndex++) {
+                requestForInput.add(new Request(inputIndex, chunkIndex, chunks.get(chunkIndex), inputs));
+            }
+            requests.add(requestForInput);
+            // size the results array with the expected number of request/responses
+            results.add(new AtomicReferenceArray<>(chunks.size()));
+        }
+
+        AtomicInteger counter = new AtomicInteger();
+        this.batchRequests = requests.stream()
+            .flatMap(List::stream)
+            .collect(Collectors.groupingBy(it -> counter.getAndIncrement() / maxNumberOfInputsPerBatch))
+            .values()
+            .stream()
+            .map(BatchRequest::new)
+            .toList();
+    }
+
     public EmbeddingRequestChunker(List<String> inputs, int maxNumberOfInputsPerBatch, ChunkingSettings chunkingSettings) {
         this.inputs = inputs;
         this.results = new ArrayList<>(inputs.size());

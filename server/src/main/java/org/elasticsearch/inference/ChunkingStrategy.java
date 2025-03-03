@@ -15,7 +15,9 @@ import java.util.EnumSet;
 
 public enum ChunkingStrategy {
     WORD("word"),
-    SENTENCE("sentence");
+    SENTENCE("sentence"),
+    SEMANTIC("semantic"),
+    CLUSTER_SEMANTIC("cluster_semantic");
 
     private final String chunkingStrategy;
 

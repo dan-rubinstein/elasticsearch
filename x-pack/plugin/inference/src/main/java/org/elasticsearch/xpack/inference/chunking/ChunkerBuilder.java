@@ -18,6 +18,8 @@ public class ChunkerBuilder {
         return switch (chunkingStrategy) {
             case WORD -> new WordBoundaryChunker();
             case SENTENCE -> new SentenceBoundaryChunker();
+            case SEMANTIC -> throw new IllegalArgumentException("SemanticChunker is not supported");
+            case CLUSTER_SEMANTIC -> throw new IllegalArgumentException("ClusterSemanticChunker is not supported");
         };
     }
 }
