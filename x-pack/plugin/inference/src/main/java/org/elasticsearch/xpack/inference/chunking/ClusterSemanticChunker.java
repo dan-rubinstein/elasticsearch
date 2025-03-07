@@ -108,8 +108,7 @@ public class ClusterSemanticChunker {
                 int currentLength = chunks.get(i).chunkOffset.end() - chunks.get(i).chunkOffset.start();
 
                 for (int j = i; j < chunks.size(); j++) {
-                    // TODO: Add the next one in the list. Instead of working on the current one work on the next one
-                    if (usedChunks[j]) continue;
+                    if (usedChunks[j]) break;
 
                     SemanticChunkerUtils.SemanticChunkData chunk = chunks.get(j);
                     int chunkLength = chunk.chunkOffset.end() - chunk.chunkOffset.start();
