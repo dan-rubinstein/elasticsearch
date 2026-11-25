@@ -52,12 +52,14 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
@@ -189,6 +191,32 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
         Map<String, Object> footer = decodeLine(footerPart);
         assertThat(footer.get("is_partial"), equalTo(true));
         assertThat(footer.get("complete"), equalTo(false));
+        s.response().close();
+    }
+
+    /**
+     * An earlier phase's warnings are not in the response headers, so the last line must take them from the completed work.
+     * Otherwise it says {@code is_partial: true} without the warning that explains why.
+     */
+    public void testLimitFooterReportsCompletedPhaseWarnings() throws IOException {
+        Set<String> completedWarnings = new LinkedHashSet<>();
+        Subscribed s = subscribe(
+            simpleColumns(),
+            null,
+            ZoneOffset.UTC,
+            new StreamOptions(StreamOptions.Store.NONE, 3, StreamOptions.NO_LIMIT),
+            () -> true,
+            () -> Set.copyOf(completedWarnings),
+            new ThreadContext(Settings.EMPTY)
+        );
+        ChunkedRestResponseBodyPart pagePart = sendFirstPage(s, buildLargePage(5, 1));
+        // Reported by an earlier phase after the stream started: it is read when the last line is built.
+        completedWarnings.add("Line 1:1: skipped a row; results are partial");
+        decodeRows(pagePart);
+        ChunkedRestResponseBodyPart footerPart = nextPart(pagePart, () -> {});
+        Map<String, Object> footer = decodeLine(footerPart);
+        assertThat(footer.get("is_partial"), equalTo(true));
+        assertThat(footer.get("warnings"), equalTo(List.of("Line 1:1: skipped a row; results are partial")));
         s.response().close();
     }
 
@@ -729,7 +757,7 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
         EsqlStreamResponseListener listener = new EsqlStreamResponseListener(channel, new ThreadContext(Settings.EMPTY));
 
         listener.resultStreamListener()
-            .onResponse(new EsqlStreamQueryAction.ResultStream(simpleColumns(), publisher, null, ZoneOffset.UTC, () -> false));
+            .onResponse(new EsqlStreamQueryAction.ResultStream(simpleColumns(), publisher, null, ZoneOffset.UTC, () -> false, Set::of));
         assertThat("no response before the first page", channel.okResponses, equalTo(0));
         assertThat(channel.errorResponses, equalTo(0));
         assertTrue("publisher should be unblocked after early demand", publisher.waitForWriting().listener().isDone());
@@ -751,7 +779,7 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
         EsqlStreamResponseListener listener = new EsqlStreamResponseListener(channel, new ThreadContext(Settings.EMPTY));
 
         listener.resultStreamListener()
-            .onResponse(new EsqlStreamQueryAction.ResultStream(simpleColumns(), publisher, null, ZoneOffset.UTC, () -> false));
+            .onResponse(new EsqlStreamQueryAction.ResultStream(simpleColumns(), publisher, null, ZoneOffset.UTC, () -> false, Set::of));
         assertThat("no 200 OK before the first page", channel.okAttempts, equalTo(0));
 
         producer.addPage(buildSimplePage(1, "first"));
@@ -863,12 +891,24 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
         BooleanSupplier isPartial,
         ThreadContext threadContext
     ) {
+        return subscribe(columns, nullColumns, zoneId, options, isPartial, Set::of, threadContext);
+    }
+
+    private Subscribed subscribe(
+        List<ColumnInfoImpl> columns,
+        boolean[] nullColumns,
+        ZoneId zoneId,
+        StreamOptions options,
+        BooleanSupplier isPartial,
+        Supplier<Set<String>> completedWarnings,
+        ThreadContext threadContext
+    ) {
         PageStreamPublisher publisher = new PageStreamPublisher();
         PageStreamPublisher.Producer producer = publisher.registerProducer();
         FakeRestChannel channel = new FakeRestChannel(new FakeRestRequest(), true);
         EsqlStreamResponseListener listener = new EsqlStreamResponseListener(channel, threadContext, options);
         listener.resultStreamListener()
-            .onResponse(new EsqlStreamQueryAction.ResultStream(columns, publisher, nullColumns, zoneId, isPartial));
+            .onResponse(new EsqlStreamQueryAction.ResultStream(columns, publisher, nullColumns, zoneId, isPartial, completedWarnings));
         return new Subscribed(publisher, producer, channel, listener);
     }
 

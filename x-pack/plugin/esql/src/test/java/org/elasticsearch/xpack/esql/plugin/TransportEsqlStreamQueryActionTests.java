@@ -782,6 +782,35 @@ public class TransportEsqlStreamQueryActionTests extends ESTestCase {
         assertTrue("an intermediate phase's partial work must be visible before the query ends", supplier.getAsBoolean());
     }
 
+    /**
+     * A limit footer reads the accumulator's warnings live, and a failure footer reads them from the finished accumulator.
+     * Both must report the same ones, so a response that ends at a limit explains its {@code is_partial} as a failure does.
+     */
+    public void testAccumulatedWarningsAgreeWithFailureFooter() {
+        String warning = "Line 1:1: skipped a row; results are partial";
+        EsqlExecutionInfo executionInfo = new EsqlExecutionInfo(alias -> false, EsqlExecutionInfo.IncludeExecutionMetadata.NEVER);
+        DriverCompletionInfo.AtomicAccumulator completedWork = new DriverCompletionInfo.AtomicAccumulator();
+        assertThat(completedWork.warnings(), equalTo(Set.of()));
+
+        completedWork.accumulate(
+            new DriverCompletionInfo(0, 0, 0, 0, 0, 0, 0, 0, List.of(), List.of(), Map.of(), true, false, Set.of(warning))
+        );
+
+        assertThat(completedWork.warnings(), equalTo(Set.of(warning)));
+        ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
+        assertThat(
+            TransportEsqlStreamQueryAction.footerWarnings(threadContext, completedWork.warnings()),
+            equalTo(
+                TransportEsqlStreamQueryAction.failureFooter(
+                    new RuntimeException("boom"),
+                    executionInfo,
+                    completedWork.finish(),
+                    threadContext
+                ).warnings()
+            )
+        );
+    }
+
     public void testPartialSoFarReflectsExecutionInfo() {
         EsqlExecutionInfo executionInfo = new EsqlExecutionInfo(alias -> false, EsqlExecutionInfo.IncludeExecutionMetadata.NEVER);
         BooleanSupplier supplier = TransportEsqlStreamQueryAction.partialSoFar(executionInfo, new DriverCompletionInfo.AtomicAccumulator());

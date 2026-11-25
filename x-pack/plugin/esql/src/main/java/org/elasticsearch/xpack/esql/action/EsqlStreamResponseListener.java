@@ -41,6 +41,7 @@ import java.time.ZoneId;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Flow;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -69,8 +70,9 @@ import static org.elasticsearch.ElasticsearchException.REST_EXCEPTION_SKIP_STACK
  *   <li>Last line (a limit was reached): {@code {"status":200,"took":N,"is_partial":<bool>,"warnings":[...],
  *       "complete":false,"next_offset":N}}. The query did not finish, so there are no statistics, {@code _clusters}
  *       or profile. {@code is_partial} reflects the failures recorded up to the point the response ended (for example a
- *       skipped remote cluster); {@code complete: false} is what signals the truncation. The query is cancelled when the
- *       response is released.</li>
+ *       skipped remote cluster), and {@code warnings} are the ones reported up to that point, including those of the
+ *       phases that had already completed; {@code complete: false} is what signals the truncation. The query is cancelled
+ *       when the response is released.</li>
  * </ul>
  *
  * <p>{@code complete} is true only when the stream ended with a normal completion signal; any error, including
@@ -120,6 +122,8 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
     private volatile ZoneId zoneId;
     /** Whether the query has recorded failures so far; read when this listener builds its own last line. */
     private volatile BooleanSupplier isPartial = () -> false;
+    /** The warnings of the phases that have completed so far; read when this listener builds its own last line. */
+    private volatile Supplier<Set<String>> completedWarnings = Set::of;
     private final AtomicReference<Page> inFlightPage = new AtomicReference<>();
     private final AtomicLong rowsWritten = new AtomicLong();
     private final AtomicLong bytesWritten = new AtomicLong();
@@ -222,16 +226,18 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
 
     /**
      * The query's warnings, read from the context captured when the stream started rather than from the calling thread,
-     * which may be a Netty thread whose context holds none of the query's response headers.
+     * which may be a Netty thread whose context holds none of the query's response headers. The warnings of the phases that
+     * have already completed are not in those headers, so they are added from {@link #completedWarnings}, which keeps the
+     * line consistent with {@code is_partial} when an earlier phase is what made the query partial.
      */
     private List<String> queryWarnings() {
         Supplier<ThreadContext.StoredContext> restorer = contextRestorer;
         if (restorer == null) {
             // Before the stream started: the caller is still on the query's own thread.
-            return TransportEsqlStreamQueryAction.footerWarnings(threadContext, DriverCompletionInfo.EMPTY);
+            return TransportEsqlStreamQueryAction.footerWarnings(threadContext, completedWarnings.get());
         }
         try (ThreadContext.StoredContext ignored = restorer.get()) {
-            return TransportEsqlStreamQueryAction.footerWarnings(threadContext, DriverCompletionInfo.EMPTY);
+            return TransportEsqlStreamQueryAction.footerWarnings(threadContext, completedWarnings.get());
         }
     }
 
@@ -268,6 +274,7 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
         this.nullColumns = resultStream.nullColumns();
         this.zoneId = resultStream.zoneId();
         this.isPartial = resultStream.isPartial();
+        this.completedWarnings = resultStream.completedWarnings();
         assert zoneId != null : "ResultStream must carry the resolved query time zone";
         this.contextRestorer = threadContext.newRestorableContext(false);
         resultStream.publisher().subscribe(subscriber);

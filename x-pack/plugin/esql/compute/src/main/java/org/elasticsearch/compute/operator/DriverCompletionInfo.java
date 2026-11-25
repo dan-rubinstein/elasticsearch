@@ -588,12 +588,8 @@ public record DriverCompletionInfo(
             return partial.get();
         }
 
-        public DriverCompletionInfo finish() {
-            Map<String, List<Map<String, Object>>> snapshot;
-            synchronized (capturedSourceMetadata) {
-                snapshot = capturedSourceMetadata.isEmpty() ? Map.of() : new HashMap<>(capturedSourceMetadata);
-            }
-            Set<String> warningsSnapshot;
+        /** A snapshot of the warnings accumulated so far, in the order they were added. */
+        public Set<String> warnings() {
             synchronized (warnings) {
                 /*
                  * Preserve insertion order of the warnings so we get stuff like:
@@ -601,8 +597,16 @@ public record DriverCompletionInfo(
                  *   param a must be positive but was [-1231]
                  *   param b must be a string at least 100 characters but was [candy]
                  */
-                warningsSnapshot = warnings.isEmpty() ? Set.of() : Collections.unmodifiableSet(new LinkedHashSet<>(warnings));
+                return warnings.isEmpty() ? Set.of() : Collections.unmodifiableSet(new LinkedHashSet<>(warnings));
             }
+        }
+
+        public DriverCompletionInfo finish() {
+            Map<String, List<Map<String, Object>>> snapshot;
+            synchronized (capturedSourceMetadata) {
+                snapshot = capturedSourceMetadata.isEmpty() ? Map.of() : new HashMap<>(capturedSourceMetadata);
+            }
+            Set<String> warningsSnapshot = warnings();
             return new DriverCompletionInfo(
                 documentsFound.get(),
                 valuesLoaded.get(),

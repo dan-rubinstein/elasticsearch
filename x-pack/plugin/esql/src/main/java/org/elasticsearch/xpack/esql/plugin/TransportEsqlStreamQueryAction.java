@@ -74,6 +74,7 @@ import org.elasticsearch.xpack.esql.view.ViewResolver;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -85,6 +86,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 import static org.elasticsearch.xpack.esql.plugin.TransportEsqlQueryAction.getOrCreateSessionID;
 
@@ -316,7 +318,8 @@ public class TransportEsqlStreamQueryAction extends TransportAction<EsqlStreamQu
                             columns,
                             nullColumns,
                             QuerySettings.TIME_ZONE.get(configuration.resolvedSettings()),
-                            isPartialSoFar
+                            isPartialSoFar,
+                            completedWork::warnings
                         );
                         if (startFailure != null) {
                             resultListener.onFailure(startFailure);
@@ -422,7 +425,8 @@ public class TransportEsqlStreamQueryAction extends TransportAction<EsqlStreamQu
                         columns,
                         request.dropNullColumns() ? new boolean[columns.size()] : null,
                         QuerySettings.TIME_ZONE.get(result.configuration().resolvedSettings()),
-                        isPartialSoFar
+                        isPartialSoFar,
+                        completedWork::warnings
                     );
                     if (startFailure != null) {
                         // The compute completed and nobody reads the result: its work is still reported.
@@ -520,10 +524,11 @@ public class TransportEsqlStreamQueryAction extends TransportAction<EsqlStreamQu
         List<ColumnInfoImpl> columns,
         boolean[] nullColumns,
         ZoneId zoneId,
-        BooleanSupplier isPartial
+        BooleanSupplier isPartial,
+        Supplier<Set<String>> completedWarnings
     ) {
         request.resultStreamListener()
-            .onResponse(new EsqlStreamQueryAction.ResultStream(columns, publisher, nullColumns, zoneId, isPartial));
+            .onResponse(new EsqlStreamQueryAction.ResultStream(columns, publisher, nullColumns, zoneId, isPartial, completedWarnings));
         Exception startFailure = publisher.failure();
         if (startFailure != null) {
             return startFailure;
@@ -633,7 +638,12 @@ public class TransportEsqlStreamQueryAction extends TransportAction<EsqlStreamQu
     }
 
     public static List<String> footerWarnings(ThreadContext threadContext, DriverCompletionInfo completionInfo) {
-        LinkedHashSet<String> warnings = new LinkedHashSet<>(completionInfo.warnings());
+        return footerWarnings(threadContext, completionInfo.warnings());
+    }
+
+    /** The driver warnings followed by the warning headers in the thread context, without duplicates. */
+    public static List<String> footerWarnings(ThreadContext threadContext, Collection<String> driverWarnings) {
+        LinkedHashSet<String> warnings = new LinkedHashSet<>(driverWarnings);
         for (String header : threadContext.getResponseHeaders().getOrDefault("Warning", List.of())) {
             warnings.add(HeaderWarning.decodeAndUnescape(HeaderWarning.extractWarningValueFromWarningHeader(header, false)));
         }
@@ -650,6 +660,7 @@ public class TransportEsqlStreamQueryAction extends TransportAction<EsqlStreamQu
     /**
      * A live view of whether the query is partial so far: the execution info's flag, or work already completed by an earlier
      * phase. This is the same condition {@link #failureFooter} reports, so a response that ends at a limit agrees with one that fails.
+     * The warnings that explain it travel alongside, as {@link DriverCompletionInfo.AtomicAccumulator#warnings()}.
      */
     static BooleanSupplier partialSoFar(EsqlExecutionInfo executionInfo, DriverCompletionInfo.AtomicAccumulator completedWork) {
         return () -> executionInfo.isPartial() || completedWork.partial();

@@ -8,9 +8,11 @@
 package org.elasticsearch.xpack.esql.action;
 
 import org.elasticsearch.Build;
+import org.elasticsearch.TransportVersion;
 import org.elasticsearch.action.ActionFuture;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.ActionResponse;
+import org.elasticsearch.action.IndicesRequest;
 import org.elasticsearch.action.admin.cluster.node.tasks.list.ListTasksResponse;
 import org.elasticsearch.action.admin.cluster.reroute.ClusterRerouteUtils;
 import org.elasticsearch.action.fieldcaps.TransportFieldCapabilitiesAction;
@@ -21,6 +23,7 @@ import org.elasticsearch.cluster.coordination.FollowersChecker;
 import org.elasticsearch.cluster.coordination.LeaderChecker;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.common.Strings;
+import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.component.Lifecycle;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeValue;
@@ -37,6 +40,7 @@ import org.elasticsearch.test.disruption.ServiceDisruptionScheme;
 import org.elasticsearch.test.transport.MockTransportService;
 import org.elasticsearch.transport.RemoteClusterService;
 import org.elasticsearch.transport.TransportChannel;
+import org.elasticsearch.transport.TransportResponse;
 import org.elasticsearch.transport.TransportSettings;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.json.JsonXContent;
@@ -47,6 +51,7 @@ import org.elasticsearch.xpack.esql.EsqlStreamTestUtils.StreamOutcome;
 import org.elasticsearch.xpack.esql.EsqlStreamTestUtils.Terminal;
 import org.elasticsearch.xpack.esql.EsqlTestUtils;
 import org.elasticsearch.xpack.esql.plugin.ComputeService;
+import org.elasticsearch.xpack.esql.plugin.DataNodeComputeResponses;
 import org.elasticsearch.xpack.esql.plugin.TransportEsqlQueryAction;
 import org.junit.After;
 import org.junit.Before;
@@ -54,6 +59,7 @@ import org.junit.BeforeClass;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
@@ -82,6 +88,7 @@ import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.in;
 import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.not;
 
 /**
@@ -379,6 +386,21 @@ public class EsqlStreamDisruptionIT extends AbstractEsqlIntegTestCase {
         }
     }
 
+    /** Like {@link #streamBody(String, int)}, with extra top-level fields such as {@code max_rows} or {@code max_bytes}. */
+    private static String streamBody(String query, int pageSize, Map<String, Object> extraFields) {
+        try (XContentBuilder builder = JsonXContent.contentBuilder()) {
+            builder.startObject().field("query", query);
+            builder.startObject("pragma").field("page_size", pageSize).endObject();
+            builder.field("accept_pragma_risks", true);
+            for (Map.Entry<String, Object> field : extraFields.entrySet()) {
+                builder.field(field.getKey(), field.getValue());
+            }
+            return Strings.toString(builder.endObject());
+        } catch (IOException e) {
+            throw new AssertionError("failed to build stream request body", e);
+        }
+    }
+
     private static String describe(StreamOutcome outcome) {
         return Strings.format(
             "httpStatus=%s, lines=%d, terminal=%s, error=%s, transportFailure=%s",
@@ -509,6 +531,108 @@ public class EsqlStreamDisruptionIT extends AbstractEsqlIntegTestCase {
         Map<String, Object> error = (Map<String, Object>) footer.get("error");
         assertThat(error, hasKey("root_cause"));
         assertThat(footer, not(hasKey("documents_found")));
+    }
+
+    /**
+     * A response that ends at {@code max_rows} or {@code max_bytes} builds its last line while the query is still running. If an
+     * earlier phase (here the IN-subquery) already did partial work, the last line must say so: {@code complete: false} for the
+     * truncation, and {@code is_partial: true} with the phase's warnings for the partial work.
+     *
+     * <p>The coordinator learns about that work only from the completion info of the earlier phase's data-node responses. It is
+     * not recorded in the execution info until the final result arrives, which is after the response has ended. A real source of
+     * such work is a lenient external read that dropped records; here the subquery's data-node responses are rewritten instead, so
+     * the test needs no external source. A small page size keeps the outer query blocked on back-pressure when the limit is reached,
+     * so its final result cannot arrive first and mark the execution info partial.</p>
+     */
+    @SuppressWarnings("unchecked")
+    public void testLimitFooterReportsPartialIntermediatePhase() throws Exception {
+        assumeTrue("requires query pragmas for page_size", canUseQueryPragmas());
+        String subIndex = "stream_sub";
+        int subDocCount = 50;
+        assertAcked(
+            prepareCreate(subIndex).setSettings(Settings.builder().put("index.number_of_shards", 1).put("index.number_of_replicas", 0))
+                .setMapping("value", "type=integer")
+        );
+        List<IndexRequestBuilder> docs = new ArrayList<>(subDocCount);
+        for (int i = 0; i < subDocCount; i++) {
+            docs.add(client().prepareIndex(subIndex).setSource(Map.of("value", i)));
+        }
+        indexRandom(true, docs);
+        ensureGreen(subIndex);
+
+        String partialWarning = "Line 1:1: injected partial work in an earlier phase; results are partial";
+        AtomicLong rewrites = new AtomicLong();
+        for (String node : internalCluster().getNodeNames()) {
+            MockTransportService.getInstance(node)
+                .addRequestHandlingBehavior(ComputeService.DATA_ACTION_NAME, (handler, request, channel, task) -> {
+                    if (request instanceof IndicesRequest indicesRequest && Arrays.asList(indicesRequest.indices()).contains(subIndex)) {
+                        handler.messageReceived(request, new PartialWorkChannel(channel, partialWarning, rewrites), task);
+                    } else {
+                        handler.messageReceived(request, channel, task);
+                    }
+                });
+        }
+
+        // Every row of the outer query matches, so the unlimited result is subDocCount rows; the limit must cut it short.
+        String query = "FROM " + STREAM_INDEX + " | WHERE value IN (FROM " + subIndex + " | KEEP value) | SORT value | KEEP value";
+        Map<String, Object> limit = randomBoolean() ? Map.of("max_rows", between(1, 10)) : Map.of("max_bytes", between(1, 30));
+        StreamOutcome outcome = stream(streamBody(query, 5, limit), null, "allow_partial_results=true");
+        assertServerFullyCleanedUp();
+
+        assertThat("the subquery's data-node responses must have been rewritten; " + describe(outcome), rewrites.get(), greaterThan(0L));
+        assertThat(describe(outcome), outcome.httpStatus(), equalTo(200));
+        assertThat(describe(outcome), outcome.terminal(), equalTo(Terminal.FOOTER));
+        Map<String, Object> footer = outcome.terminalLine();
+        assertThat("limit " + limit + ", footer " + footer, footer.get("complete"), equalTo(false));
+        assertThat("rows were left unsent", outcome.rowCount(), lessThan((long) subDocCount));
+        assertThat("an earlier phase's partial work must show in the last line", footer.get("is_partial"), equalTo(true));
+        assertThat((List<String>) footer.get("warnings"), hasItem(partialWarning));
+    }
+
+    /** Delegates to {@code delegate}, but marks every data-node compute response as partial work with {@code warning}. */
+    private static final class PartialWorkChannel implements TransportChannel {
+        private final TransportChannel delegate;
+        private final String warning;
+        private final AtomicLong rewrites;
+
+        PartialWorkChannel(TransportChannel delegate, String warning, AtomicLong rewrites) {
+            this.delegate = delegate;
+            this.warning = warning;
+            this.rewrites = rewrites;
+        }
+
+        @Override
+        public String getProfileName() {
+            return delegate.getProfileName();
+        }
+
+        @Override
+        public void sendResponse(TransportResponse response) {
+            delegate.sendResponse(rewrite(response));
+        }
+
+        @Override
+        public void sendResponse(TransportResponse response, CircuitBreaker circuitBreaker) {
+            delegate.sendResponse(rewrite(response), circuitBreaker);
+        }
+
+        @Override
+        public void sendResponse(Exception exception) {
+            delegate.sendResponse(exception);
+        }
+
+        @Override
+        public TransportVersion getVersion() {
+            return delegate.getVersion();
+        }
+
+        private TransportResponse rewrite(TransportResponse response) {
+            TransportResponse rewritten = DataNodeComputeResponses.markPartial(response, warning);
+            if (rewritten != response) {
+                rewrites.incrementAndGet();
+            }
+            return rewritten;
+        }
     }
 
     private void assertShardFailureMidStream(boolean allowPartial) throws Exception {

@@ -13,7 +13,9 @@ import org.elasticsearch.compute.operator.PageStreamPublisher;
 
 import java.time.ZoneId;
 import java.util.List;
+import java.util.Set;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 
 /**
  * Action type for streaming ES|QL execution on {@code POST /_query/stream}.
@@ -47,12 +49,17 @@ public class EsqlStreamQueryAction extends ActionType<ActionResponse.Empty> {
      *
      * <p>{@code isPartial} is a live view of whether the query has recorded failures so far (a skipped cluster, failed
      * shards, ...). It can turn true after the stream starts, so it is read when a last line is built, not here.</p>
+     *
+     * <p>{@code completedWarnings} is likewise a live view of the warnings reported by the phases that have already
+     * completed. They are not in the response headers, so a last line built by the listener reads them here to explain an
+     * {@code isPartial} that came from an earlier phase.</p>
      */
     public record ResultStream(
         List<ColumnInfoImpl> columns,
         PageStreamPublisher publisher,
         boolean[] nullColumns,
         ZoneId zoneId,
-        BooleanSupplier isPartial
+        BooleanSupplier isPartial,
+        Supplier<Set<String>> completedWarnings
     ) {}
 }
